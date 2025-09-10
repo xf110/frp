@@ -1,5 +1,5 @@
 // client/service.go
-package event
+package legacy
 
 import (
 	"errors"
