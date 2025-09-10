@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync" // 1. 新增：导入sync包，解决undefined: sync
-
+    "time"
 	"github.com/miekg/dns"
 	"gopkg.in/ini.v1"
 
