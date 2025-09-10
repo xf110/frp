@@ -158,6 +158,11 @@ type ClientCommonConf struct {
 	UDPPacketSize int64 `ini:"udp_packet_size" json:"udp_packet_size"`
 	IncludeConfigFiles []string `ini:"includes" json:"includes"`
 	PprofEnable bool `ini:"pprof_enable" json:"pprof_enable"`
+	// 新增：TXT记录动态刷新配置
+    TXTRefreshInterval int64 `ini:"txt_refresh_interval" json:"txt_refresh_interval"` // 单位：秒，0表示不刷新
+    currentServerAddr  string // 当前使用的服务器地址（内存变量，不持久化）
+    currentServerPort  int    // 当前使用的服务器端口（内存变量，不持久化）
+    mu                 sync.RWMutex // 并发安全锁（避免刷新与重连竞态）
 }
 
 func LoadAllProxyConfsFromIni(
@@ -310,6 +315,7 @@ func GetDefaultClientConf() ClientCommonConf {
 		DisableCustomTLSFirstByte: true,
 		Metas:                     make(map[string]string),
 		IncludeConfigFiles:        make([]string, 0),
+		TXTRefreshInterval: 300, // 0=关闭动态刷新，用户需手动设置（如600=10分钟）
 	}
 }
 
