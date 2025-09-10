@@ -7,10 +7,11 @@ import (
 	"net"
 	"sync"
 	"time"
+	"strings"
 
-	"github.com/fatedier/frp/pkg/config/legacy"
-	"github.com/fatedier/frp/pkg/transport"
-	"github.com/fatedier/frp/pkg/util/log"
+	"gopkg.in/ini.v1"
+
+	legacyauth "github.com/fatedier/frp/pkg/auth/legacy"
 )
 
 // Service 管理frpc客户端的核心服务逻辑
