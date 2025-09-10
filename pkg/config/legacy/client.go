@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync" // 1. 新增：导入sync包，解决undefined: sync
 
 	"github.com/miekg/dns"
 	"gopkg.in/ini.v1"
@@ -16,64 +17,75 @@ import (
 	"github.com/fatedier/frp/pkg/util/util"
 )
 
-// 新增：解析服务器地址，支持txt://前缀
-func resolveServerAddr(addr string) (string, int, error) {
+// 2. 修正：函数增加dnsServer参数，支持使用客户端配置的DNS服务器（而非硬编码8.8.8.8）
+func resolveServerAddr(addr, dnsServer string) (string, int, error) {
 	if strings.HasPrefix(addr, "txt://") {
 		domain := strings.TrimPrefix(addr, "txt://")
-		return resolveFromTXT(domain)
+		return resolveFromTXT(domain, dnsServer) // 传DNS服务器参数
 	}
 
-	// 原有逻辑：处理普通地址格式
-	host, port, err := net.SplitHostPort(addr)
+	// 原有普通地址解析逻辑
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		// 如果没有指定端口，使用默认7000
-		return addr, 7000, nil
+		return addr, 7000, nil // 未指定端口时用默认7000
 	}
-	p, err := strconv.Atoi(port)
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid port: %v", err)
+		return "", 0, fmt.Errorf("invalid port: %s", portStr)
 	}
-	return host, p, nil
+	return host, port, nil
 }
 
-// 新增：从TXT记录解析服务器地址和端口
-func resolveFromTXT(domain string) (string, int, error) {
+// 3. 修正：接收dnsServer参数，优先使用客户端配置的DNS
+func resolveFromTXT(domain, dnsServer string) (string, int, error) {
 	resolver := dns.Client{}
 	msg := dns.Msg{}
 	msg.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
-	
-	// 优先使用配置中指定的DNS服务器，否则使用默认
-	dnsServer := "8.8.8.8:53"
-	
-	r, _, err := resolver.Exchange(&msg, dnsServer)
-	if err != nil {
-		return "", 0, fmt.Errorf("dns query failed: %v", err)
-	}
 
-	if len(r.Answer) == 0 {
-		return "", 0, fmt.Errorf("no TXT records found for %s", domain)
-	}
-
-	// 解析TXT记录，格式应为"host:port"
-	for _, ans := range r.Answer {
-		if txt, ok := ans.(*dns.TXT); ok {
-			for _, s := range txt.Txt {
-				parts := strings.Split(s, ":")
-				if len(parts) == 2 {
-					port, err := strconv.Atoi(parts[1])
-					if err != nil {
-						continue
-					}
-					return parts[0], port, nil
-				}
-			}
+	// 优先用客户端配置的DNS，否则用默认8.8.8.8:53
+	dnsAddr := "8.8.8.8:53"
+	if dnsServer != "" {
+		// 补全DNS端口（未指定时默认53）
+		if _, _, err := net.SplitHostPort(dnsServer); err != nil {
+			dnsAddr = fmt.Sprintf("%s:53", dnsServer)
+		} else {
+			dnsAddr = dnsServer
 		}
 	}
 
-	return "", 0, fmt.Errorf("invalid TXT record format for %s, expected 'host:port'", domain)
+	// 发送DNS查询
+	r, _, err := resolver.Exchange(&msg, dnsAddr)
+	if err != nil {
+		return "", 0, fmt.Errorf("dns query failed (server: %s): %v", dnsAddr, err)
+	}
+
+	if len(r.Answer) == 0 {
+		return "", 0, fmt.Errorf("no TXT records found for domain: %s", domain)
+	}
+
+	// 解析TXT记录（格式：host:port）
+	for _, ans := range r.Answer {
+		txtRecord, ok := ans.(*dns.TXT)
+		if !ok {
+			continue
+		}
+		for _, txt := range txtRecord.Txt {
+			parts := strings.Split(txt, ":")
+			if len(parts) != 2 {
+				continue
+			}
+			host := parts[0]
+			port, err := strconv.Atoi(parts[1])
+			if err != nil || port < 1 || port > 65535 {
+				continue // 端口无效，跳过
+			}
+			return host, port, nil
+		}
+	}
+
+	return "", 0, fmt.Errorf("no valid TXT record (format: host:port) for domain: %s", domain)
 }
 
-// 修改UnmarshalClientConfFromIni函数，添加TXT解析逻辑
 func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 	f, err := ini.LoadSources(ini.LoadOptions{
 		Insensitive:         false,
@@ -88,25 +100,27 @@ func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 
 	s, err := f.GetSection("common")
 	if err != nil {
-		return ClientCommonConf{}, fmt.Errorf("invalid configuration file, not found [common] section")
+		return ClientCommonConf{}, fmt.Errorf("invalid config: missing [common] section")
 	}
 
 	common := GetDefaultClientConf()
-	err = s.MapTo(&common)
-	if err != nil {
+	if err := s.MapTo(&common); err != nil {
 		return ClientCommonConf{}, err
 	}
 
-	// 新增：解析server_addr（核心逻辑）
-	resolvedHost, resolvedPort, err := resolveServerAddr(common.ServerAddr)
+	// 4. 修正：调用resolveServerAddr时传入客户端配置的DNSServer
+	resolvedHost, resolvedPort, err := resolveServerAddr(common.ServerAddr, common.DNSServer)
 	if err != nil {
-		return ClientCommonConf{}, fmt.Errorf("failed to resolve server address: %v", err)
+		return ClientCommonConf{}, fmt.Errorf("resolve server addr failed: %v", err)
 	}
 	common.ServerAddr = resolvedHost
-	// 仅当配置中未指定server_port时使用解析结果
 	if common.ServerPort == 0 {
 		common.ServerPort = resolvedPort
 	}
+
+	// 初始化当前地址（动态刷新时对比用）
+	common.CurrentServerAddr = resolvedHost
+	common.CurrentServerPort = resolvedPort
 
 	common.Metas = GetMapWithoutPrefix(s.KeysHash(), "meta_")
 	common.OidcAdditionalEndpointParams = GetMapWithoutPrefix(s.KeysHash(), "oidc_additional_")
@@ -114,12 +128,13 @@ func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 	return common, nil
 }
 
-// 以下为文件原有内容，保持不变
+// 5. 修正：结构体中私有字段改为大写开头（导出字段，动态刷新时其他包可访问）
 type ClientCommonConf struct {
 	legacyauth.ClientConfig `ini:",extends"`
 
+	// 原有客户端配置字段（保持不变）
 	ServerAddr string `ini:"server_addr" json:"server_addr"`
-	ServerPort int `ini:"server_port" json:"server_port"`
+	ServerPort int    `ini:"server_port" json:"server_port"`
 	NatHoleSTUNServer string `ini:"nat_hole_stun_server" json:"nat_hole_stun_server"`
 	DialServerTimeout int64 `ini:"dial_server_timeout" json:"dial_server_timeout"`
 	DialServerKeepAlive int64 `ini:"dial_server_keepalive" json:"dial_server_keepalive"`
@@ -139,7 +154,7 @@ type ClientCommonConf struct {
 	TCPMux bool `ini:"tcp_mux" json:"tcp_mux"`
 	TCPMuxKeepaliveInterval int64 `ini:"tcp_mux_keepalive_interval" json:"tcp_mux_keepalive_interval"`
 	User string `ini:"user" json:"user"`
-	DNSServer string `ini:"dns_server" json:"dns_server"`
+	DNSServer string `ini:"dns_server" json:"dns_server"` // 客户端配置的DNS服务器
 	LoginFailExit bool `ini:"login_fail_exit" json:"login_fail_exit"`
 	Start []string `ini:"start" json:"start"`
 	Protocol string `ini:"protocol" json:"protocol"`
@@ -158,19 +173,20 @@ type ClientCommonConf struct {
 	UDPPacketSize int64 `ini:"udp_packet_size" json:"udp_packet_size"`
 	IncludeConfigFiles []string `ini:"includes" json:"includes"`
 	PprofEnable bool `ini:"pprof_enable" json:"pprof_enable"`
-	// 新增：TXT记录动态刷新配置
-    TXTRefreshInterval int64 `ini:"txt_refresh_interval" json:"txt_refresh_interval"` // 单位：秒，0表示不刷新
-    currentServerAddr  string // 当前使用的服务器地址（内存变量，不持久化）
-    currentServerPort  int    // 当前使用的服务器端口（内存变量，不持久化）
-    mu                 sync.RWMutex // 并发安全锁（避免刷新与重连竞态）
+
+	// 新增：TXT动态刷新相关字段（修正为大写开头，支持跨包访问）
+	TXTRefreshInterval int64        `ini:"txt_refresh_interval" json:"txt_refresh_interval"` // 刷新间隔（秒）
+	CurrentServerAddr  string       `ini:"-" json:"-"` // 修正：大写开头，导出字段
+	CurrentServerPort  int          `ini:"-" json:"-"` // 修正：大写开头，导出字段
+	Mu                 sync.RWMutex `ini:"-" json:"-"` // 修正：大写开头，导出锁
 }
 
+// 以下原有函数（LoadAllProxyConfsFromIni、renderRangeProxyTemplates等）保持不变
 func LoadAllProxyConfsFromIni(
 	prefix string,
 	source any,
 	start []string,
 ) (map[string]ProxyConf, map[string]VisitorConf, error) {
-	// 原有实现保持不变
 	f, err := ini.LoadSources(ini.LoadOptions{
 		Insensitive:         false,
 		InsensitiveSections: false,
@@ -249,7 +265,6 @@ func LoadAllProxyConfsFromIni(
 }
 
 func renderRangeProxyTemplates(f *ini.File, section *ini.Section) error {
-	// 原有实现保持不变
 	localPortStr := section.Key("local_port").String()
 	remotePortStr := section.Key("remote_port").String()
 	if localPortStr == "" || remotePortStr == "" {
@@ -286,10 +301,10 @@ func renderRangeProxyTemplates(f *ini.File, section *ini.Section) error {
 
 		copySection(section, tmpsection)
 		if _, err := tmpsection.NewKey("local_port", fmt.Sprintf("%d", localPorts[i])); err != nil {
-			return fmt.Errorf("local_port new key in section error: %v", err)
+			return fmt.Errorf("local_port new key error: %v", err)
 		}
 		if _, err := tmpsection.NewKey("remote_port", fmt.Sprintf("%d", remotePorts[i])); err != nil {
-			return fmt.Errorf("remote_port new key in section error: %v", err)
+			return fmt.Errorf("remote_port new key error: %v", err)
 		}
 	}
 
@@ -297,14 +312,12 @@ func renderRangeProxyTemplates(f *ini.File, section *ini.Section) error {
 }
 
 func copySection(source, target *ini.Section) {
-	// 原有实现保持不变
 	for key, value := range source.KeysHash() {
 		_, _ = target.NewKey(key, value)
 	}
 }
 
 func GetDefaultClientConf() ClientCommonConf {
-	// 原有实现保持不变
 	return ClientCommonConf{
 		ClientConfig:              legacyauth.GetDefaultClientConf(),
 		TCPMux:                    true,
@@ -315,44 +328,47 @@ func GetDefaultClientConf() ClientCommonConf {
 		DisableCustomTLSFirstByte: true,
 		Metas:                     make(map[string]string),
 		IncludeConfigFiles:        make([]string, 0),
-		TXTRefreshInterval: 300, // 0=关闭动态刷新，用户需手动设置（如600=10分钟）
+		TXTRefreshInterval:        0, // 默认关闭动态刷新（需用户手动设置>0的值）
 	}
 }
 
 func (cfg *ClientCommonConf) Validate() error {
-	// 原有实现保持不变
 	if cfg.HeartbeatTimeout > 0 && cfg.HeartbeatInterval > 0 {
 		if cfg.HeartbeatTimeout < cfg.HeartbeatInterval {
-			return fmt.Errorf("invalid heartbeat_timeout, heartbeat_timeout is less than heartbeat_interval")
+			return fmt.Errorf("heartbeat_timeout < heartbeat_interval")
 		}
 	}
 
 	if !cfg.TLSEnable {
 		if cfg.TLSCertFile != "" {
-			fmt.Println("WARNING! tls_cert_file is invalid when tls_enable is false")
+			fmt.Println("WARNING: tls_cert_file is invalid when tls_enable=false")
 		}
-
 		if cfg.TLSKeyFile != "" {
-			fmt.Println("WARNING! tls_key_file is invalid when tls_enable is false")
+			fmt.Println("WARNING: tls_key_file is invalid when tls_enable=false")
 		}
-
 		if cfg.TLSTrustedCaFile != "" {
-			fmt.Println("WARNING! tls_trusted_ca_file is invalid when tls_enable is false")
+			fmt.Println("WARNING: tls_trusted_ca_file is invalid when tls_enable=false")
 		}
 	}
 
 	if !slices.Contains([]string{"tcp", "kcp", "quic", "websocket", "wss"}, cfg.Protocol) {
-		return fmt.Errorf("invalid protocol")
+		return fmt.Errorf("invalid protocol: %s", cfg.Protocol)
 	}
 
 	for _, f := range cfg.IncludeConfigFiles {
 		absDir, err := filepath.Abs(filepath.Dir(f))
 		if err != nil {
-			return fmt.Errorf("include: parse directory of %s failed: %v", f, err)
+			return fmt.Errorf("include file dir parse failed: %s, err: %v", f, err)
 		}
 		if _, err := os.Stat(absDir); os.IsNotExist(err) {
-			return fmt.Errorf("include: directory of %s not exist", f)
+			return fmt.Errorf("include file dir not exist: %s", absDir)
 		}
 	}
+
+	// 新增：验证TXT刷新间隔（必须≥0）
+	if cfg.TXTRefreshInterval < 0 {
+		return fmt.Errorf("txt_refresh_interval must be ≥ 0 (current: %d)", cfg.TXTRefreshInterval)
+	}
+
 	return nil
 }
