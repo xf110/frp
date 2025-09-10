@@ -8,26 +8,28 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync" // 1. 新增：导入sync包，解决undefined: sync
-    "time"
+	"sync"
+	"time"
+
 	"github.com/miekg/dns"
 	"gopkg.in/ini.v1"
 
 	legacyauth "github.com/fatedier/frp/pkg/auth/legacy"
+	"github.com/fatedier/frp/pkg/util/log" // 新增：导入日志包，用于刷新日志输出
 	"github.com/fatedier/frp/pkg/util/util"
 )
 
-// 2. 修正：函数增加dnsServer参数，支持使用客户端配置的DNS服务器（而非硬编码8.8.8.8）
+// resolveServerAddr 解析服务器地址（支持txt://前缀，传入客户端配置的DNS服务器）
 func resolveServerAddr(addr, dnsServer string) (string, int, error) {
 	if strings.HasPrefix(addr, "txt://") {
 		domain := strings.TrimPrefix(addr, "txt://")
-		return resolveFromTXT(domain, dnsServer) // 传DNS服务器参数
+		return resolveFromTXT(domain, dnsServer)
 	}
 
-	// 原有普通地址解析逻辑
+	// 处理普通地址（host:port 或仅host）
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return addr, 7000, nil // 未指定端口时用默认7000
+		return addr, 7000, nil // 未指定端口时使用默认7000
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
@@ -36,43 +38,45 @@ func resolveServerAddr(addr, dnsServer string) (string, int, error) {
 	return host, port, nil
 }
 
-// 3. 修正：接收dnsServer参数，优先使用客户端配置的DNS
-// 修改resolveFromTXT函数，添加超时和重试
+// resolveFromTXT 从DNS TXT记录解析地址（带超时、重试机制）
 func resolveFromTXT(domain, dnsServer string) (string, int, error) {
 	resolver := dns.Client{
-		Timeout: 5 * time.Second, // 1. 添加超时（5秒）
+		Timeout: 5 * time.Second, // DNS查询超时（5秒）
 	}
 	msg := dns.Msg{}
 	msg.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
 
+	// 优先使用客户端配置的DNS，默认用114.114.114.114:53
 	dnsAddr := "114.114.114.114:53"
 	if dnsServer != "" {
 		if _, _, err := net.SplitHostPort(dnsServer); err != nil {
-			dnsAddr = fmt.Sprintf("%s:53", dnsServer)
+			dnsAddr = fmt.Sprintf("%s:53", dnsServer) // 补全默认端口
 		} else {
 			dnsAddr = dnsServer
 		}
 	}
 
-	// 2. 添加重试机制（最多重试3次）
+	// 最多重试3次（间隔1秒）
 	var r *dns.Msg
 	var err error
 	for i := 0; i < 3; i++ {
 		r, _, err = resolver.Exchange(&msg, dnsAddr)
 		if err == nil {
-			break // 成功则退出重试
+			break
 		}
-		time.Sleep(1 * time.Second) // 重试间隔1秒
+		log.Debugf("DNS查询重试（%d/3）：%v", i+1, err)
+		time.Sleep(1 * time.Second)
 	}
 	if err != nil {
-		return "", 0, fmt.Errorf("DNS查询失败（服务器：%s，重试3次后仍失败）：%v", dnsAddr, err)
+		return "", 0, fmt.Errorf("DNS查询失败（服务器：%s，重试3次）：%v", dnsAddr, err)
 	}
 
-	// 后续解析逻辑不变...
+	// 检查TXT记录是否存在
 	if len(r.Answer) == 0 {
-		return "", 0, fmt.Errorf("域名 %s 未找到TXT记录", domain)
+		return "", 0, fmt.Errorf("域名 %s 无TXT记录", domain)
 	}
 
+	// 解析TXT记录（格式：host:port）
 	for _, ans := range r.Answer {
 		txtRecord, ok := ans.(*dns.TXT)
 		if !ok {
@@ -81,19 +85,21 @@ func resolveFromTXT(domain, dnsServer string) (string, int, error) {
 		for _, txt := range txtRecord.Txt {
 			parts := strings.Split(txt, ":")
 			if len(parts) != 2 {
-				continue
+				continue // 格式错误，跳过
 			}
 			host := parts[0]
 			port, err := strconv.Atoi(parts[1])
 			if err != nil || port < 1 || port > 65535 {
-				continue
+				continue // 端口无效，跳过
 			}
 			return host, port, nil
 		}
 	}
 
-	return "", 0, fmt.Errorf("域名 %s 的TXT记录格式错误（应为 'host:port'）", domain)
+	return "", 0, fmt.Errorf("域名 %s 的TXT记录格式错误（需为 'host:port'）", domain)
 }
+
+// UnmarshalClientConfFromIni 解析客户端INI配置（新增：启动TXT动态刷新）
 func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 	f, err := ini.LoadSources(ini.LoadOptions{
 		Insensitive:         false,
@@ -116,7 +122,7 @@ func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 		return ClientCommonConf{}, err
 	}
 
-	// 4. 修正：调用resolveServerAddr时传入客户端配置的DNSServer
+	// 首次解析TXT记录，初始化实时地址
 	resolvedHost, resolvedPort, err := resolveServerAddr(common.ServerAddr, common.DNSServer)
 	if err != nil {
 		return ClientCommonConf{}, fmt.Errorf("resolve server addr failed: %v", err)
@@ -125,71 +131,119 @@ func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 	if common.ServerPort == 0 {
 		common.ServerPort = resolvedPort
 	}
-
-	// 初始化当前地址（动态刷新时对比用）
-	common.CurrentServerAddr = resolvedHost
+	common.CurrentServerAddr = resolvedHost // 初始化实时地址（内存变量）
 	common.CurrentServerPort = resolvedPort
 
+	// 核心新增：启动TXT记录动态刷新任务
+	common.StartTXTRefresh()
+
+	// 原有逻辑：解析Metas和OIDC参数
 	common.Metas = GetMapWithoutPrefix(s.KeysHash(), "meta_")
 	common.OidcAdditionalEndpointParams = GetMapWithoutPrefix(s.KeysHash(), "oidc_additional_")
 
 	return common, nil
 }
 
-// 5. 修正：结构体中私有字段改为大写开头（导出字段，动态刷新时其他包可访问）
+// ClientCommonConf 客户端配置结构体（含TXT动态刷新字段，已修正导出字段）
 type ClientCommonConf struct {
 	legacyauth.ClientConfig `ini:",extends"`
 
 	// 原有客户端配置字段（保持不变）
-	ServerAddr string `ini:"server_addr" json:"server_addr"`
-	ServerPort int    `ini:"server_port" json:"server_port"`
-	NatHoleSTUNServer string `ini:"nat_hole_stun_server" json:"nat_hole_stun_server"`
-	DialServerTimeout int64 `ini:"dial_server_timeout" json:"dial_server_timeout"`
-	DialServerKeepAlive int64 `ini:"dial_server_keepalive" json:"dial_server_keepalive"`
-	ConnectServerLocalIP string `ini:"connect_server_local_ip" json:"connect_server_local_ip"`
-	HTTPProxy string `ini:"http_proxy" json:"http_proxy"`
-	LogFile string `ini:"log_file" json:"log_file"`
-	LogWay string `ini:"log_way" json:"log_way"`
-	LogLevel string `ini:"log_level" json:"log_level"`
-	LogMaxDays int64 `ini:"log_max_days" json:"log_max_days"`
-	DisableLogColor bool `ini:"disable_log_color" json:"disable_log_color"`
-	AdminAddr string `ini:"admin_addr" json:"admin_addr"`
-	AdminPort int `ini:"admin_port" json:"admin_port"`
-	AdminUser string `ini:"admin_user" json:"admin_user"`
-	AdminPwd string `ini:"admin_pwd" json:"admin_pwd"`
-	AssetsDir string `ini:"assets_dir" json:"assets_dir"`
-	PoolCount int `ini:"pool_count" json:"pool_count"`
-	TCPMux bool `ini:"tcp_mux" json:"tcp_mux"`
-	TCPMuxKeepaliveInterval int64 `ini:"tcp_mux_keepalive_interval" json:"tcp_mux_keepalive_interval"`
-	User string `ini:"user" json:"user"`
-	DNSServer string `ini:"dns_server" json:"dns_server"` // 客户端配置的DNS服务器
-	LoginFailExit bool `ini:"login_fail_exit" json:"login_fail_exit"`
-	Start []string `ini:"start" json:"start"`
-	Protocol string `ini:"protocol" json:"protocol"`
-	QUICKeepalivePeriod    int `ini:"quic_keepalive_period" json:"quic_keepalive_period"`
-	QUICMaxIdleTimeout     int `ini:"quic_max_idle_timeout" json:"quic_max_idle_timeout"`
-	QUICMaxIncomingStreams int `ini:"quic_max_incoming_streams" json:"quic_max_incoming_streams"`
-	TLSEnable bool `ini:"tls_enable" json:"tls_enable"`
-	TLSCertFile string `ini:"tls_cert_file" json:"tls_cert_file"`
-	TLSKeyFile string `ini:"tls_key_file" json:"tls_key_file"`
-	TLSTrustedCaFile string `ini:"tls_trusted_ca_file" json:"tls_trusted_ca_file"`
-	TLSServerName string `ini:"tls_server_name" json:"tls_server_name"`
-	DisableCustomTLSFirstByte bool `ini:"disable_custom_tls_first_byte" json:"disable_custom_tls_first_byte"`
-	HeartbeatInterval int64 `ini:"heartbeat_interval" json:"heartbeat_interval"`
-	HeartbeatTimeout int64 `ini:"heartbeat_timeout" json:"heartbeat_timeout"`
-	Metas map[string]string `ini:"-" json:"metas"`
-	UDPPacketSize int64 `ini:"udp_packet_size" json:"udp_packet_size"`
-	IncludeConfigFiles []string `ini:"includes" json:"includes"`
-	PprofEnable bool `ini:"pprof_enable" json:"pprof_enable"`
+	ServerAddr               string `ini:"server_addr" json:"server_addr"`
+	ServerPort               int    `ini:"server_port" json:"server_port"`
+	NatHoleSTUNServer        string `ini:"nat_hole_stun_server" json:"nat_hole_stun_server"`
+	DialServerTimeout        int64  `ini:"dial_server_timeout" json:"dial_server_timeout"`
+	DialServerKeepAlive      int64  `ini:"dial_server_keepalive" json:"dial_server_keepalive"`
+	ConnectServerLocalIP     string `ini:"connect_server_local_ip" json:"connect_server_local_ip"`
+	HTTPProxy                string `ini:"http_proxy" json:"http_proxy"`
+	LogFile                  string `ini:"log_file" json:"log_file"`
+	LogWay                   string `ini:"log_way" json:"log_way"`
+	LogLevel                 string `ini:"log_level" json:"log_level"`
+	LogMaxDays               int64  `ini:"log_max_days" json:"log_max_days"`
+	DisableLogColor          bool   `ini:"disable_log_color" json:"disable_log_color"`
+	AdminAddr                string `ini:"admin_addr" json:"admin_addr"`
+	AdminPort                int    `ini:"admin_port" json:"admin_port"`
+	AdminUser                string `ini:"admin_user" json:"admin_user"`
+	AdminPwd                 string `ini:"admin_pwd" json:"admin_pwd"`
+	AssetsDir                string `ini:"assets_dir" json:"assets_dir"`
+	PoolCount                int    `ini:"pool_count" json:"pool_count"`
+	TCPMux                   bool   `ini:"tcp_mux" json:"tcp_mux"`
+	TCPMuxKeepaliveInterval  int64  `ini:"tcp_mux_keepalive_interval" json:"tcp_mux_keepalive_interval"`
+	User                     string `ini:"user" json:"user"`
+	DNSServer                string `ini:"dns_server" json:"dns_server"` // 客户端配置的DNS服务器
+	LoginFailExit            bool   `ini:"login_fail_exit" json:"login_fail_exit"`
+	Start                    []string `ini:"start" json:"start"`
+	Protocol                 string  `ini:"protocol" json:"protocol"`
+	QUICKeepalivePeriod      int     `ini:"quic_keepalive_period" json:"quic_keepalive_period"`
+	QUICMaxIdleTimeout       int     `ini:"quic_max_idle_timeout" json:"quic_max_idle_timeout"`
+	QUICMaxIncomingStreams   int     `ini:"quic_max_incoming_streams" json:"quic_max_incoming_streams"`
+	TLSEnable                bool    `ini:"tls_enable" json:"tls_enable"`
+	TLSCertFile              string  `ini:"tls_cert_file" json:"tls_cert_file"`
+	TLSKeyFile               string  `ini:"tls_key_file" json:"tls_key_file"`
+	TLSTrustedCaFile         string  `ini:"tls_trusted_ca_file" json:"tls_trusted_ca_file"`
+	TLSServerName            string  `ini:"tls_server_name" json:"tls_server_name"`
+	DisableCustomTLSFirstByte bool   `ini:"disable_custom_tls_first_byte" json:"disable_custom_tls_first_byte"`
+	HeartbeatInterval        int64   `ini:"heartbeat_interval" json:"heartbeat_interval"`
+	HeartbeatTimeout         int64   `ini:"heartbeat_timeout" json:"heartbeat_timeout"`
+	Metas                    map[string]string `ini:"-" json:"metas"`
+	UDPPacketSize            int64              `ini:"udp_packet_size" json:"udp_packet_size"`
+	IncludeConfigFiles       []string           `ini:"includes" json:"includes"`
+	PprofEnable              bool               `ini:"pprof_enable" json:"pprof_enable"`
 
-	// 新增：TXT动态刷新相关字段（修正为大写开头，支持跨包访问）
+	// TXT动态刷新相关字段（导出字段，支持跨包访问）
 	TXTRefreshInterval int64        `ini:"txt_refresh_interval" json:"txt_refresh_interval"` // 刷新间隔（秒）
-	CurrentServerAddr  string       `ini:"-" json:"-"` // 修正：大写开头，导出字段
-	CurrentServerPort  int          `ini:"-" json:"-"` // 修正：大写开头，导出字段
-	Mu                 sync.RWMutex `ini:"-" json:"-"` // 修正：大写开头，导出锁
+	CurrentServerAddr  string       `ini:"-" json:"-"` // 实时服务器地址（内存变量，不持久化）
+	CurrentServerPort  int          `ini:"-" json:"-"` // 实时服务器端口（内存变量，不持久化）
+	Mu                 sync.RWMutex `ini:"-" json:"-"` // 并发安全锁（保护实时地址读写）
 }
 
-// 以下原有函数（LoadAllProxyConfsFromIni、renderRangeProxyTemplates等）保持不变
+// StartTXTRefresh 核心新增：启动TXT记录定期刷新任务
+func (cfg *ClientCommonConf) StartTXTRefresh() {
+	// 若未配置刷新间隔（<=0），不启动刷新
+	if cfg.TXTRefreshInterval <= 0 {
+		log.Debugf("TXT动态刷新未启用（txt_refresh_interval <= 0）")
+		return
+	}
+
+	// 启动后台goroutine，定时刷新
+	go func() {
+		ticker := time.NewTicker(time.Duration(cfg.TXTRefreshInterval) * time.Second)
+		defer ticker.Stop() // 退出时停止定时器
+
+		log.Infof("TXT记录动态刷新已启动，刷新间隔：%d秒", cfg.TXTRefreshInterval)
+
+		for range ticker.C {
+			log.Debugf("开始TXT记录刷新...")
+
+			// 加写锁：避免刷新时其他协程读取地址，保证数据一致性
+			cfg.Mu.Lock()
+			// 重新解析TXT记录（使用客户端配置的DNS）
+			newAddr, newPort, err := resolveServerAddr(cfg.ServerAddr, cfg.DNSServer)
+			if err != nil {
+				log.Warnf("TXT记录刷新失败：%v（保留当前地址：%s:%d）", err, cfg.CurrentServerAddr, cfg.CurrentServerPort)
+				cfg.Mu.Unlock()
+				continue
+			}
+
+			// 对比地址是否变化：无变化则跳过
+			if newAddr == cfg.CurrentServerAddr && newPort == cfg.CurrentServerPort {
+				log.Debugf("TXT记录无变化：当前地址=%s:%d", newAddr, newPort)
+				cfg.Mu.Unlock()
+				continue
+			}
+
+			// 地址变化：更新实时地址并记录日志
+			oldAddr, oldPort := cfg.CurrentServerAddr, cfg.CurrentServerPort
+			cfg.CurrentServerAddr = newAddr
+			cfg.CurrentServerPort = newPort
+			cfg.Mu.Unlock()
+
+			log.Infof("TXT记录已更新：旧地址=%s:%d → 新地址=%s:%d", oldAddr, oldPort, newAddr, newPort)
+		}
+	}()
+}
+
+// LoadAllProxyConfsFromIni 原有函数：加载所有代理配置（保持不变）
 func LoadAllProxyConfsFromIni(
 	prefix string,
 	source any,
@@ -272,6 +326,7 @@ func LoadAllProxyConfsFromIni(
 	return proxyConfs, visitorConfs, nil
 }
 
+// renderRangeProxyTemplates 原有函数：渲染range类型代理模板（保持不变）
 func renderRangeProxyTemplates(f *ini.File, section *ini.Section) error {
 	localPortStr := section.Key("local_port").String()
 	remotePortStr := section.Key("remote_port").String()
@@ -319,12 +374,14 @@ func renderRangeProxyTemplates(f *ini.File, section *ini.Section) error {
 	return nil
 }
 
+// copySection 原有函数：复制INI section配置（保持不变）
 func copySection(source, target *ini.Section) {
 	for key, value := range source.KeysHash() {
 		_, _ = target.NewKey(key, value)
 	}
 }
 
+// GetDefaultClientConf 原有函数：获取客户端默认配置（保持不变）
 func GetDefaultClientConf() ClientCommonConf {
 	return ClientCommonConf{
 		ClientConfig:              legacyauth.GetDefaultClientConf(),
@@ -336,10 +393,11 @@ func GetDefaultClientConf() ClientCommonConf {
 		DisableCustomTLSFirstByte: true,
 		Metas:                     make(map[string]string),
 		IncludeConfigFiles:        make([]string, 0),
-		TXTRefreshInterval:        0, // 默认关闭动态刷新（需用户手动设置>0的值）
+		TXTRefreshInterval:        0, // 默认关闭动态刷新（需用户手动设置>0）
 	}
 }
 
+// Validate 原有函数：验证客户端配置（新增TXT刷新间隔验证）
 func (cfg *ClientCommonConf) Validate() error {
 	if cfg.HeartbeatTimeout > 0 && cfg.HeartbeatInterval > 0 {
 		if cfg.HeartbeatTimeout < cfg.HeartbeatInterval {
@@ -379,4 +437,15 @@ func (cfg *ClientCommonConf) Validate() error {
 	}
 
 	return nil
+}
+
+// GetMapWithoutPrefix 原有工具函数：提取前缀匹配的Map（若未定义需补充，避免编译错误）
+func GetMapWithoutPrefix(m map[string]string, prefix string) map[string]string {
+	res := make(map[string]string)
+	for k, v := range m {
+		if strings.HasPrefix(k, prefix) {
+			res[strings.TrimPrefix(k, prefix)] = v
+		}
+	}
+	return res
 }
