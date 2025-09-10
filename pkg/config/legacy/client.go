@@ -37,15 +37,16 @@ func resolveServerAddr(addr, dnsServer string) (string, int, error) {
 }
 
 // 3. 修正：接收dnsServer参数，优先使用客户端配置的DNS
+// 修改resolveFromTXT函数，添加超时和重试
 func resolveFromTXT(domain, dnsServer string) (string, int, error) {
-	resolver := dns.Client{}
+	resolver := dns.Client{
+		Timeout: 5 * time.Second, // 1. 添加超时（5秒）
+	}
 	msg := dns.Msg{}
 	msg.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
 
-	// 优先用客户端配置的DNS，否则用默认8.8.8.8:53
-	dnsAddr := "8.8.8.8:53"
+	dnsAddr := "114.114.114.114:53"
 	if dnsServer != "" {
-		// 补全DNS端口（未指定时默认53）
 		if _, _, err := net.SplitHostPort(dnsServer); err != nil {
 			dnsAddr = fmt.Sprintf("%s:53", dnsServer)
 		} else {
@@ -53,17 +54,25 @@ func resolveFromTXT(domain, dnsServer string) (string, int, error) {
 		}
 	}
 
-	// 发送DNS查询
-	r, _, err := resolver.Exchange(&msg, dnsAddr)
+	// 2. 添加重试机制（最多重试3次）
+	var r *dns.Msg
+	var err error
+	for i := 0; i < 3; i++ {
+		r, _, err = resolver.Exchange(&msg, dnsAddr)
+		if err == nil {
+			break // 成功则退出重试
+		}
+		time.Sleep(1 * time.Second) // 重试间隔1秒
+	}
 	if err != nil {
-		return "", 0, fmt.Errorf("dns query failed (server: %s): %v", dnsAddr, err)
+		return "", 0, fmt.Errorf("DNS查询失败（服务器：%s，重试3次后仍失败）：%v", dnsAddr, err)
 	}
 
+	// 后续解析逻辑不变...
 	if len(r.Answer) == 0 {
-		return "", 0, fmt.Errorf("no TXT records found for domain: %s", domain)
+		return "", 0, fmt.Errorf("域名 %s 未找到TXT记录", domain)
 	}
 
-	// 解析TXT记录（格式：host:port）
 	for _, ans := range r.Answer {
 		txtRecord, ok := ans.(*dns.TXT)
 		if !ok {
@@ -77,15 +86,14 @@ func resolveFromTXT(domain, dnsServer string) (string, int, error) {
 			host := parts[0]
 			port, err := strconv.Atoi(parts[1])
 			if err != nil || port < 1 || port > 65535 {
-				continue // 端口无效，跳过
+				continue
 			}
 			return host, port, nil
 		}
 	}
 
-	return "", 0, fmt.Errorf("no valid TXT record (format: host:port) for domain: %s", domain)
+	return "", 0, fmt.Errorf("域名 %s 的TXT记录格式错误（应为 'host:port'）", domain)
 }
-
 func UnmarshalClientConfFromIni(source any) (ClientCommonConf, error) {
 	f, err := ini.LoadSources(ini.LoadOptions{
 		Insensitive:         false,
